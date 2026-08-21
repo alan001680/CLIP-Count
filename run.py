@@ -39,7 +39,7 @@ os.environ["CUDA_LAUNCH_BLOCKING"] = '1'
 
 def get_args_parser():
     parser = argparse.ArgumentParser('CLIP-Count', add_help=False)
-    parser.add_argument("--mode",type = str, default = "app", choices = ["train", "test", "app"], help = "train or test or an interactive application")
+    parser.add_argument("--mode",type = str, default = "train", choices = ["train", "test", "app"], help = "train or test or an interactive application")
     parser.add_argument("--exp_name",type = str, default = "exp0821", help = "experiment name")
     parser.add_argument('--batch_size', default=32, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
