@@ -39,8 +39,8 @@ os.environ["CUDA_LAUNCH_BLOCKING"] = '1'
 
 def get_args_parser():
     parser = argparse.ArgumentParser('CLIP-Count', add_help=False)
-    parser.add_argument("--mode",type = str, default = "train", choices = ["train", "test", "app"], help = "train or test or an interactive application")
-    parser.add_argument("--exp_name",type = str, default = "exp", help = "experiment name")
+    parser.add_argument("--mode",type = str, default = "app", choices = ["train", "test", "app"], help = "train or test or an interactive application")
+    parser.add_argument("--exp_name",type = str, default = "exp0821", help = "experiment name")
     parser.add_argument('--batch_size', default=32, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
     parser.add_argument('--epochs', default=200, type=int)
@@ -94,7 +94,7 @@ def get_args_parser():
     parser.add_argument('--seed', default=1, type=int)
 
 
-    parser.add_argument('--ckpt', default=None, type = str,
+    parser.add_argument('--ckpt', default='lightning_logs/exp/version_0/checkpoints/epoch=198-val_mae=15.09.ckpt', type = str,
                         help='path of resume from checkpoint')
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')
@@ -404,8 +404,22 @@ class Model(LightningModule):
             weight_decay=self.args.weight_decay,
         )
 
-        schedular = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.33)
-        return {"optimizer": optimizer, "lr_scheduler": schedular, "monitor": "val_mae"}
+        # Original scheduler configuration (for the original PyTorch environment):
+        # schedular = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.33)
+        # return {"optimizer": optimizer, "lr_scheduler": schedular, "monitor": "val_mae"}
+
+        # Compatible with PyTorch 2.8 and PyTorch Lightning 1.8.
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=100,
+            gamma=0.33,
+        )
+        return {"optimizer": optimizer, "lr_scheduler": scheduler}
+
+    def lr_scheduler_step(self, scheduler, optimizer_idx, metric):
+        # Lightning 1.8 does not recognize PyTorch 2.8's new LRScheduler
+        # base class, so explicitly define how the scheduler is stepped.
+        scheduler.step()
 
     def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
         # delete frozen clip parameters
