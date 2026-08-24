@@ -94,7 +94,7 @@ def get_args_parser():
     parser.add_argument('--seed', default=1, type=int)
 
 
-    parser.add_argument('--ckpt', default='lightning_logs/exp/version_0/checkpoints/epoch=198-val_mae=15.09.ckpt', type = str,
+    parser.add_argument('--ckpt', default= 'lightning_logs/exp0821/version_0/checkpoints/epoch=194-val_mae=15.94.ckpt', type = str,
                         help='path of resume from checkpoint')
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')

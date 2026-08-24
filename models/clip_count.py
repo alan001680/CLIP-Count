@@ -369,7 +369,22 @@ class CLIPTextTransformer(nn.Module):
 
         # x.shape = [batch_size, n_ctx, transformer.width]
         # # take features from the eot embedding (eot_token is the highest number in each sequence)
-        x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.clip_model.text_projection
+        # Original implementation (incorrect when CoOp context tokens are inserted):
+        # x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.clip_model.text_projection
+        eot_indices = text.argmax(dim=-1)
+        if self.use_coop:
+            # CoOp inserts n_ctx tokens immediately after [SOS], shifting the
+            # class tokens and [EOS] token to the right by n_ctx positions.
+            eot_indices = eot_indices + self.n_ctx
+
+        if torch.any(eot_indices >= x.shape[1]):
+            raise ValueError(
+                "The prompt is too long after inserting CoOp context tokens. "
+                "Use a shorter prompt or reduce coop_width."
+            )
+
+        batch_indices = torch.arange(x.shape[0], device=x.device)
+        x = x[batch_indices, eot_indices] @ self.clip_model.text_projection
         x = x.unsqueeze(1)  # [batch_size, 1, transformer.width]
         return x
 
@@ -452,6 +467,3 @@ class DensityDecoder(nn.Module):
 
 if __name__ == "__main__":
     clip_count = CLIPCount()
-
-
-    
