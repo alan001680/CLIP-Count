@@ -40,7 +40,9 @@ os.environ["CUDA_LAUNCH_BLOCKING"] = '1'
 def get_args_parser():
     parser = argparse.ArgumentParser('CLIP-Count', add_help=False)
     parser.add_argument("--mode",type = str, default = "app", choices = ["train", "test", "app"], help = "train or test or an interactive application")
-    parser.add_argument("--exp_name",type = str, default = "exp0821", help = "experiment name")
+
+    parser.add_argument("--exp_name",type = str, default = "exp0825", help = "experiment name")
+
     parser.add_argument('--batch_size', default=32, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
     parser.add_argument('--epochs', default=200, type=int)
@@ -73,7 +75,7 @@ def get_args_parser():
     parser.add_argument("--noise_text_ratio", default = 0.0, type = float, help = "ratio of noise text")
     parser.add_argument('--normalize_contrast',default=False, type = misc.str2bool, help = "whether to normalize contrastive loss")
     parser.add_argument('--contrast_pos', default = "pre", choices = ["pre", "post"], type = str, help = "Use contrastive loss before or after the interaction")
-    parser.add_argument('--contrast_pre_epoch', default = 20, type = int, help = "how many epoch to use contrastive pretraining")
+    parser.add_argument('--contrast_pre_epoch', default = 30, type = int, help = "how many epoch to use contrastive pretraining")
     
     # Optimizer parameters
     parser.add_argument('--weight_decay', type=float, default=0.05,
@@ -93,9 +95,7 @@ def get_args_parser():
                         help='path where to save, empty for no saving')
     parser.add_argument('--seed', default=1, type=int)
 
-
-    parser.add_argument('--ckpt', default='lightning_logs/exp/version_0/checkpoints/epoch=198-val_mae=15.09.ckpt', type = str,
-                        help='path of resume from checkpoint')
+    parser.add_argument('--ckpt', default= 'lightning_logs/exp0824/version_2/checkpoints/epoch=94-val_mae=14.38.ckpt', type = str,  help='path of resume from checkpoint')
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')
     parser.add_argument('--num_workers', default=12, type=int)
@@ -577,13 +577,29 @@ if __name__ == '__main__':
             fn=infer,
             inputs=[
                 # height = 384, keep aspect ratio
-                gr.inputs.Image(label="Image"),
-                gr.inputs.Textbox(lines=1, label="Prompt (What would you like to count)"),
+                # Original Gradio 3 components:
+                # gr.inputs.Image(label="Image"),
+                # gr.inputs.Textbox(lines=1, label="Prompt (What would you like to count)"),
+                gr.Image(type="numpy", label="Image"),
+                gr.Textbox(
+                    lines=1,
+                    label="Prompt (What would you like to count)",
+                    placeholder="For example: car, apple, or person",
+                ),
             ],
-            outputs= ["image", "number"],
-            interpretation="default",
+            outputs=[
+                # Original Gradio 3 outputs:
+                # "image", "number"
+                gr.Image(label="Density Map"),
+                gr.Number(label="Predicted Count"),
+            ],
+            # Original setting (incompatible with the current Gradio/FastAPI stack):
+            # interpretation="default",
             title="CLIP-Count",
             description="A unified counting model to count them all.",
             
         )
-        demo.launch(share=True)
+
+        # Original local launch setting:
+        # demo.launch(share=False)
+        demo.launch(share=False, show_error=True)
