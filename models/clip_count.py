@@ -26,7 +26,11 @@ class CLIPCount(nn.Module):
                  backbone:str="b16",
                  use_fim:bool = True, 
                  use_mixed_fim:bool=False, 
-                 unfreeze_vit:bool=False):
+                 unfreeze_vit:bool=False,
+                 use_similarity_gate:bool=False,
+                 gate_temperature:float=0.1,
+                 gate_threshold:float=0.0,
+                 gate_residual:float=0.2):
         """
         The CLIP-Count model   
         Param:
@@ -42,8 +46,21 @@ class CLIPCount(nn.Module):
             use_fim: whether to use a naive transformer for patch-text interaction
             use_mixed_fim: whether to use a hierarchical transformer for patch-text interaction
             unfreeze_vit: whether to fintune all clip vit parameters.
+            use_similarity_gate: whether patch-text similarity controls the decoder features.
+            gate_temperature: sigmoid temperature for the similarity gate.
+            gate_threshold: cosine-similarity value at the sigmoid midpoint.
+            gate_residual: minimum fraction of decoder features retained by the gate.
         """
         super().__init__()
+
+        if gate_temperature <= 0:
+            raise ValueError("gate_temperature must be greater than zero")
+        if not 0.0 <= gate_residual <= 1.0:
+            raise ValueError("gate_residual must be between 0 and 1")
+        self.use_similarity_gate = use_similarity_gate
+        self.gate_temperature = gate_temperature
+        self.gate_threshold = gate_threshold
+        self.gate_residual = gate_residual
 
         # --------------------------------------------------------------------------
         # MAE encoder specifics
@@ -156,7 +173,34 @@ class CLIPCount(nn.Module):
         extra_out['patch_embedding'] = patch_embedding
         patch_embedding_contrast = self.patch_feat_proj_contrast(patch_feat)
         extra_out['patch_embedding_contrast'] = patch_embedding_contrast
+
+        # Use the projection that the patch-text contrastive/ranking losses
+        # actually train, rather than the separate decoder projection.
+        normalized_patches = F.normalize(patch_embedding_contrast.float(), dim=-1)
+        normalized_text = F.normalize(text_embedding.float(), dim=-1)
+        patch_text_similarity = torch.matmul(
+            normalized_patches, normalized_text.transpose(-1, -2)
+        ).squeeze(-1)
+        extra_out['patch_text_similarity'] = patch_text_similarity
+
+        patch_text_gate = torch.sigmoid(
+            (patch_text_similarity - self.gate_threshold)
+            / self.gate_temperature
+        )
+        extra_out['patch_text_gate'] = patch_text_gate
+
+        # Original prediction path (available with use_similarity_gate=False):
+        # x = patch_embedding
         x = patch_embedding
+        if self.use_similarity_gate:
+            residual_gate = self.gate_residual + (
+                1.0 - self.gate_residual
+            ) * patch_text_gate
+            x = x * residual_gate.to(dtype=x.dtype).unsqueeze(-1)
+        extra_out['decoder_gate_scale'] = (
+            residual_gate if self.use_similarity_gate
+            else torch.ones_like(patch_text_gate)
+        )
         x = x + self.patch_emb_pos_embed # [B, 196, 512]
 
         y_ = text_embedding # [B, 1, 512]

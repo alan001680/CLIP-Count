@@ -49,3 +49,60 @@ class ContrastiveLoss(nn.Module):
         if self.normalize:
             loss = loss / n_pos            
         return loss.mean()
+
+
+class PromptRankingLoss(nn.Module):
+    """Rank the correct prompt above a wrong prompt at annotated patches.
+
+    FSC-147 does not annotate every object class in an image, so this loss does
+    not treat unannotated image regions as belonging to the wrong prompt.  It
+    only uses patches that contain a point from the dataset's designated target
+    class, where the correct class name is known.
+    """
+
+    def __init__(self, margin=0.1):
+        super().__init__()
+        self.margin = margin
+
+    def forward(
+        self,
+        patch_embedding,
+        positive_text_embedding,
+        negative_text_embedding,
+        gt_density,
+        valid_negative=None,
+    ):
+        batch_size, patch_count, _ = patch_embedding.shape
+        grid_size = int(patch_count ** 0.5)
+        if grid_size * grid_size != patch_count:
+            raise ValueError(f"Patch count is not a square grid: {patch_count}")
+
+        target_mask = F.adaptive_max_pool2d(
+            gt_density.detach().unsqueeze(1), (grid_size, grid_size)
+        ).squeeze(1) > 0
+        target_mask = target_mask.reshape(batch_size, patch_count)
+
+        if valid_negative is not None:
+            target_mask = target_mask & valid_negative.reshape(-1, 1)
+
+        positive_similarity = F.cosine_similarity(
+            patch_embedding, positive_text_embedding, dim=-1
+        )
+        negative_similarity = F.cosine_similarity(
+            patch_embedding, negative_text_embedding, dim=-1
+        )
+        ranking = F.relu(
+            self.margin - positive_similarity + negative_similarity
+        )
+
+        target_count = target_mask.sum()
+        if target_count == 0:
+            # Preserve a differentiable zero when no valid in-batch negative
+            # or annotated target patch is available.
+            zero = ranking.sum() * 0.0
+            return zero, zero.detach(), zero.detach()
+        return (
+            ranking[target_mask].mean(),
+            positive_similarity[target_mask].mean(),
+            negative_similarity[target_mask].mean(),
+        )

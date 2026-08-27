@@ -15,7 +15,7 @@ import random
 from pathlib import Path
 import math
 from PIL import Image
-from models.contrastive_loss import ContrastiveLoss
+from models.contrastive_loss import ContrastiveLoss, PromptRankingLoss
 import torch
 import torch.nn.functional as F
 from typing import List, Dict, Any
@@ -41,7 +41,7 @@ def get_args_parser():
     parser = argparse.ArgumentParser('CLIP-Count', add_help=False)
     parser.add_argument("--mode",type = str, default = "app", choices = ["train", "test", "app"], help = "train or test or an interactive application")
 
-    parser.add_argument("--exp_name",type = str, default = "exp0825", help = "experiment name")
+    parser.add_argument("--exp_name",type = str, default = "exp0826", help = "experiment name")
 
     parser.add_argument('--batch_size', default=32, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
@@ -59,6 +59,14 @@ def get_args_parser():
     parser.add_argument('--use_mixed_fim', default=True, type = misc.str2bool, help = "whether to use hierarchical patch-text interaction")
     parser.add_argument('--unfreeze_vit', default=False, type = misc.str2bool, help = "whether to unfreeze CLIP vit i.e., finetune CLIP")
     parser.add_argument('--use_fim', default=False, type = misc.str2bool, help = "whether to use naive interaction")
+    parser.add_argument('--use_similarity_gate', default=True, type=misc.str2bool,
+                        help='use learned patch-text similarity to gate decoder patch features')
+    parser.add_argument('--gate_temperature', default=0.1, type=float,
+                        help='sigmoid temperature of the patch-text similarity gate')
+    parser.add_argument('--gate_threshold', default=0.0, type=float,
+                        help='cosine-similarity threshold at the gate midpoint')
+    parser.add_argument('--gate_residual', default=0.2, type=float,
+                        help='minimum fraction of decoder patch features retained')
     
     #contrastive loss related
     parser.add_argument('--use_coop',  default=True, type = misc.str2bool,
@@ -76,6 +84,12 @@ def get_args_parser():
     parser.add_argument('--normalize_contrast',default=False, type = misc.str2bool, help = "whether to normalize contrastive loss")
     parser.add_argument('--contrast_pos', default = "pre", choices = ["pre", "post"], type = str, help = "Use contrastive loss before or after the interaction")
     parser.add_argument('--contrast_pre_epoch', default = 30, type = int, help = "how many epoch to use contrastive pretraining")
+    parser.add_argument('--use_prompt_ranking', default=True, type=misc.str2bool,
+                        help='rank the correct class above an in-batch wrong class at annotated target patches')
+    parser.add_argument('--w_prompt_ranking', default=0.1, type=float,
+                        help='weight of the target-patch prompt ranking loss')
+    parser.add_argument('--prompt_ranking_margin', default=0.1, type=float,
+                        help='required cosine-similarity margin between correct and wrong prompts')
     
     # Optimizer parameters
     parser.add_argument('--weight_decay', type=float, default=0.05,
@@ -95,7 +109,7 @@ def get_args_parser():
                         help='path where to save, empty for no saving')
     parser.add_argument('--seed', default=1, type=int)
 
-    parser.add_argument('--ckpt', default= 'lightning_logs/exp0824/version_2/checkpoints/epoch=94-val_mae=14.38.ckpt', type = str,  help='path of resume from checkpoint')
+    parser.add_argument('--ckpt', default='lightning_logs/similarity-gate/version_0/checkpoints/epoch=0-val_mae=14.79.ckpt', type = str,  help='path of resume from checkpoint')
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')
     parser.add_argument('--num_workers', default=12, type=int)
@@ -142,10 +156,43 @@ class Model(LightningModule):
                         use_fim = self.args.use_fim,
                         use_mixed_fim = self.args.use_mixed_fim,
                         unfreeze_vit = self.args.unfreeze_vit,
+                        use_similarity_gate=getattr(self.args, 'use_similarity_gate', True),
+                        gate_temperature=getattr(self.args, 'gate_temperature', 0.1),
+                        gate_threshold=getattr(self.args, 'gate_threshold', 0.0),
+                        gate_residual=getattr(self.args, 'gate_residual', 0.2),
                         )
         self.loss = F.mse_loss
         self.contrastive_loss = ContrastiveLoss(0.07,self.args.noise_text_ratio, self.args.normalize_contrast)
+        self.prompt_ranking_loss = PromptRankingLoss(
+            getattr(self.args, 'prompt_ranking_margin', 0.1)
+        )
         self.neg_prompt_embed = None
+
+    @staticmethod
+    def select_in_batch_negative_text(text_embedding, prompts):
+        """Select the least-similar differently named prompt in each batch row."""
+        batch_size = text_embedding.shape[0]
+        normalized_text = F.normalize(text_embedding.detach().squeeze(1), dim=-1)
+        text_similarity = normalized_text @ normalized_text.transpose(0, 1)
+
+        valid = torch.tensor(
+            [
+                [first.strip().lower() != second.strip().lower() for second in prompts]
+                for first in prompts
+            ],
+            device=text_embedding.device,
+            dtype=torch.bool,
+        )
+        valid_negative = valid.any(dim=1)
+        candidate_similarity = text_similarity.masked_fill(~valid, float('inf'))
+        negative_indices = candidate_similarity.argmin(dim=1)
+        # Rows without a valid negative are ignored by PromptRankingLoss.  Use
+        # their own embedding here only to keep indexing well-defined.
+        fallback = torch.arange(batch_size, device=text_embedding.device)
+        negative_indices = torch.where(
+            valid_negative, negative_indices, fallback
+        )
+        return text_embedding[negative_indices], valid_negative
 
     def training_step(self, batch, batch_idx):
 
@@ -164,16 +211,44 @@ class Model(LightningModule):
         loss = self.loss(output, gt_density)
 
         loss = (loss * masks / (384*384)).sum() / output.shape[0]
-        if self.args.use_contrast and self.current_epoch <= self.args.contrast_pre_epoch:
-            text_embedding = extra_out['text_embedding'] # [B,1, 512]
+        text_embedding = extra_out['text_embedding'] # [B,1, 512]
+        patch_embedding_contrast = extra_out['patch_embedding_contrast']
+        # Epochs are zero-based: '<' gives exactly contrast_pre_epoch epochs
+        # (for example, epochs 0..29 when contrast_pre_epoch=30).
+        if self.args.use_contrast and self.current_epoch < self.args.contrast_pre_epoch:
             if self.args.contrast_pos == "pre":
-                patch_embedding = extra_out['patch_embedding_contrast'] # [B, 196, 512]
+                patch_embedding = patch_embedding_contrast # [B, 196, 512]
             elif self.args.contrast_pos == "post":
                 patch_embedding = extra_out['pixel_text_matching_map']
             img_embedding = extra_out['x_cls'] # [B, 1, 512]
             contrast_loss = self.contrastive_loss(patch_embedding, img_embedding, text_embedding, self.neg_prompt_embed,  gt_density.detach().clone())
-            loss = args.w_contrast * contrast_loss
+            loss = self.args.w_contrast * contrast_loss
             self.log('train_loss_contrast', contrast_loss)
+
+        if getattr(self.args, 'use_prompt_ranking', True):
+            negative_text_embedding, valid_negative = (
+                self.select_in_batch_negative_text(text_embedding, prompt_gt)
+            )
+            (
+                prompt_ranking_loss,
+                positive_target_similarity,
+                negative_target_similarity,
+            ) = self.prompt_ranking_loss(
+                patch_embedding_contrast,
+                text_embedding,
+                negative_text_embedding,
+                gt_density,
+                valid_negative,
+            )
+            loss = loss + getattr(self.args, 'w_prompt_ranking', 0.1) * prompt_ranking_loss
+            self.log('train_loss_prompt_ranking', prompt_ranking_loss)
+            self.log('train_prompt_ranking_valid_ratio', valid_negative.float().mean())
+            self.log('train_target_similarity_positive', positive_target_similarity)
+            self.log('train_target_similarity_negative', negative_target_similarity)
+            self.log(
+                'train_target_similarity_margin',
+                positive_target_similarity - negative_target_similarity,
+            )
 
 
         self.log('train_loss', loss)
@@ -484,7 +559,12 @@ if __name__ == '__main__':
     )
     if args.mode == "train":
         if args.ckpt is not None:
-            model = Model.load_from_checkpoint(args.ckpt, strict=False)
+            model = Model.load_from_checkpoint(
+                args.ckpt,
+                args=args,
+                all_classes=all_classes_train,
+                strict=False,
+            )
 
         trainer.fit(model, train_dataloader, val_dataloader)
     elif args.mode == "test":
