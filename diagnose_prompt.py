@@ -2,10 +2,8 @@
 
 This script is read-only with respect to the model: it loads a checkpoint,
 runs several prompts on the same image, and compares token IDs, text
-embeddings, patch-text similarity maps, raw density maps, and predicted counts.
-
-The similarity branch is diagnostic only: it does not alter the features sent
-to FIM or the density decoder.
+embeddings, patch-text similarity maps, raw decoder outputs, gated density
+maps, and predicted counts.
 """
 
 import argparse
@@ -28,7 +26,7 @@ def get_args_parser():
     parser = argparse.ArgumentParser(
         description="Compare CLIP-Count outputs for multiple prompts on one image."
     )
-    parser.add_argument("--ckpt", type=Path, default="lightning_logs/similarity-gate/version_0/checkpoints/epoch=12-val_mae=14.34.ckpt", help="Lightning .ckpt file")
+    parser.add_argument("--ckpt", type=Path, default="lightning_logs/exp0825/version_0/checkpoints/epoch=193-val_mae=13.63.ckpt", help="Lightning .ckpt file")
     parser.add_argument("--image", type=Path, default="data/FSC/images_384_VarV2/3.jpg", help="Input image")
     parser.add_argument(
         "--prompts",
@@ -60,6 +58,12 @@ def get_args_parser():
         default=True,
         type=misc.str2bool,
         help="Apply the similarity gate to the model prediction path",
+    )
+    parser.add_argument(
+        "--gate-position",
+        default="density",
+        choices=["none", "feature", "density", "both"],
+        help="Where to apply the similarity gate",
     )
     parser.add_argument(
         "--output-dir",
@@ -101,6 +105,10 @@ def predict_density_and_similarity(model, image, prompt, stride, raw_width):
 
     output = misc.window_composite(output.unsqueeze(1), stride=stride).squeeze(1)
     density = output[:, :, :raw_width]
+    raw_density = misc.window_composite(
+        extra_out["raw_density"].unsqueeze(1), stride=stride
+    ).squeeze(1)
+    raw_density = raw_density[:, :, :raw_width]
 
     patch_count = extra_out["patch_text_similarity"].shape[1]
     grid_size = int(patch_count**0.5)
@@ -120,7 +128,7 @@ def predict_density_and_similarity(model, image, prompt, stride, raw_width):
     )
     gate = misc.window_composite(gate, stride=stride)
     gate = gate[:, :, :raw_width]
-    return density, similarity, gate
+    return density, raw_density, similarity, gate
 
 
 def safe_filename(prompt):
@@ -195,6 +203,9 @@ def main():
     model = Model.load_from_checkpoint(str(args.ckpt), strict=False)
     model.model = model.model.to(device)
     model.model.use_similarity_gate = args.use_similarity_gate
+    model.model.gate_position = (
+        args.gate_position if args.use_similarity_gate else "none"
+    )
     model.model.gate_temperature = args.gate_temperature
     model.model.gate_threshold = args.gate_threshold
     model.model.gate_residual = args.gate_residual
@@ -206,11 +217,12 @@ def main():
         tokens, embeddings = get_text_embeddings(model, args.prompts, device)
 
         densities = []
+        raw_densities = []
         similarities = []
         gates = []
         counts = []
         for prompt in args.prompts:
-            density, similarity, gate = predict_density_and_similarity(
+            density, raw_density, similarity, gate = predict_density_and_similarity(
                 model.model,
                 image,
                 prompt,
@@ -219,22 +231,32 @@ def main():
             )
             count = torch.sum(density[0] / SCALE_FACTOR).item()
             densities.append(density[0].float())
+            raw_densities.append(raw_density[0].float())
             similarities.append(similarity[0].float())
             gates.append(gate[0].float())
             counts.append(count)
 
     print_tokens(args.prompts, tokens.cpu())
 
-    print("\n=== Raw model outputs (before visualization normalization) ===")
-    for prompt, density, count in zip(args.prompts, densities, counts):
+    print("\n=== Model outputs (before visualization normalization) ===")
+    for prompt, raw_density, density, count in zip(
+        args.prompts, raw_densities, densities, counts
+    ):
+        raw_count = torch.sum(raw_density / SCALE_FACTOR).item()
+        suppression = 1.0 - count / max(raw_count, 1e-8)
         print(
-            f"{prompt!r}: count={count:.8f}, "
+            f"{prompt!r}: raw_count={raw_count:.8f}, "
+            f"final_count={count:.8f}, suppression={suppression:.4%}, "
             f"density_min={density.min().item():.8e}, "
             f"density_max={density.max().item():.8e}, "
             f"density_mean={density.mean().item():.8e}"
         )
 
-    gate_status = "applied to prediction" if args.use_similarity_gate else "diagnostic only"
+    gate_status = (
+        f"applied at {model.model.gate_position}"
+        if model.model.gate_position != "none"
+        else "diagnostic only"
+    )
     print(f"\n=== Patch-text similarity ({gate_status}) ===")
     for prompt, similarity, gate in zip(args.prompts, similarities, gates):
         print(

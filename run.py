@@ -39,13 +39,13 @@ os.environ["CUDA_LAUNCH_BLOCKING"] = '1'
 
 def get_args_parser():
     parser = argparse.ArgumentParser('CLIP-Count', add_help=False)
-    parser.add_argument("--mode",type = str, default = "app", choices = ["train", "test", "app"], help = "train or test or an interactive application")
+    parser.add_argument("--mode",type = str, default = "train", choices = ["train", "test", "app"], help = "train or test or an interactive application")
 
-    parser.add_argument("--exp_name",type = str, default = "exp0826", help = "experiment name")
+    parser.add_argument("--exp_name",type = str, default = "hard-negative-density-gate", help = "experiment name")
 
     parser.add_argument('--batch_size', default=32, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
-    parser.add_argument('--epochs', default=200, type=int)
+    parser.add_argument('--epochs', default=20, type=int)
     parser.add_argument('--accum_iter', default=1, type=int,
                         help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
     
@@ -60,13 +60,16 @@ def get_args_parser():
     parser.add_argument('--unfreeze_vit', default=False, type = misc.str2bool, help = "whether to unfreeze CLIP vit i.e., finetune CLIP")
     parser.add_argument('--use_fim', default=False, type = misc.str2bool, help = "whether to use naive interaction")
     parser.add_argument('--use_similarity_gate', default=True, type=misc.str2bool,
-                        help='use learned patch-text similarity to gate decoder patch features')
+                        help='enable patch-text similarity gating')
+    parser.add_argument('--gate_position', default='density',
+                        choices=['none', 'feature', 'density', 'both'],
+                        help='where the similarity gate is applied')
     parser.add_argument('--gate_temperature', default=0.1, type=float,
                         help='sigmoid temperature of the patch-text similarity gate')
     parser.add_argument('--gate_threshold', default=0.0, type=float,
                         help='cosine-similarity threshold at the gate midpoint')
     parser.add_argument('--gate_residual', default=0.2, type=float,
-                        help='minimum fraction of decoder patch features retained')
+                        help='minimum feature or density fraction retained by the gate')
     
     #contrastive loss related
     parser.add_argument('--use_coop',  default=True, type = misc.str2bool,
@@ -83,18 +86,24 @@ def get_args_parser():
     parser.add_argument("--noise_text_ratio", default = 0.0, type = float, help = "ratio of noise text")
     parser.add_argument('--normalize_contrast',default=False, type = misc.str2bool, help = "whether to normalize contrastive loss")
     parser.add_argument('--contrast_pos', default = "pre", choices = ["pre", "post"], type = str, help = "Use contrastive loss before or after the interaction")
-    parser.add_argument('--contrast_pre_epoch', default = 30, type = int, help = "how many epoch to use contrastive pretraining")
+    parser.add_argument('--contrast_pre_epoch', default = 0, type = int, help = "how many epoch to use contrastive pretraining")
     parser.add_argument('--use_prompt_ranking', default=True, type=misc.str2bool,
                         help='rank the correct class above an in-batch wrong class at annotated target patches')
     parser.add_argument('--w_prompt_ranking', default=0.1, type=float,
                         help='weight of the target-patch prompt ranking loss')
     parser.add_argument('--prompt_ranking_margin', default=0.1, type=float,
                         help='required cosine-similarity margin between correct and wrong prompts')
+    parser.add_argument('--hard_negative_k', default=4, type=int,
+                        help='number of semantically similar class candidates per target class')
+    parser.add_argument('--hard_negative_max_similarity', default=0.9, type=float,
+                        help='exclude likely synonyms above this text cosine similarity')
+    parser.add_argument('--w_gate_calibration', default=0.05, type=float,
+                        help='weight of target-patch positive/negative gate calibration')
     
     # Optimizer parameters
     parser.add_argument('--weight_decay', type=float, default=0.05,
                         help='weight decay (default: 0.05)')
-    parser.add_argument('--lr', type=float, default=1e-4, metavar='LR',
+    parser.add_argument('--lr', type=float, default=1e-5, metavar='LR',
                         help='learning rate (absolute lr)')
     parser.add_argument('--min_lr', type=float, default=0., metavar='LR',
                         help='lower lr bound for cyclic schedulers that hit 0')
@@ -109,7 +118,7 @@ def get_args_parser():
                         help='path where to save, empty for no saving')
     parser.add_argument('--seed', default=1, type=int)
 
-    parser.add_argument('--ckpt', default='lightning_logs/similarity-gate/version_0/checkpoints/epoch=0-val_mae=14.79.ckpt', type = str,  help='path of resume from checkpoint')
+    parser.add_argument('--ckpt', default='lightning_logs/exp0825/version_0/checkpoints/epoch=193-val_mae=13.63.ckpt', type = str,  help='path of resume from checkpoint')
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')
     parser.add_argument('--num_workers', default=12, type=int)
@@ -157,6 +166,11 @@ class Model(LightningModule):
                         use_mixed_fim = self.args.use_mixed_fim,
                         unfreeze_vit = self.args.unfreeze_vit,
                         use_similarity_gate=getattr(self.args, 'use_similarity_gate', True),
+                        gate_position=(
+                            getattr(self.args, 'gate_position', 'density')
+                            if getattr(self.args, 'use_similarity_gate', True)
+                            else 'none'
+                        ),
                         gate_temperature=getattr(self.args, 'gate_temperature', 0.1),
                         gate_threshold=getattr(self.args, 'gate_threshold', 0.0),
                         gate_residual=getattr(self.args, 'gate_residual', 0.2),
@@ -164,13 +178,80 @@ class Model(LightningModule):
         self.loss = F.mse_loss
         self.contrastive_loss = ContrastiveLoss(0.07,self.args.noise_text_ratio, self.args.normalize_contrast)
         self.prompt_ranking_loss = PromptRankingLoss(
-            getattr(self.args, 'prompt_ranking_margin', 0.1)
+            getattr(self.args, 'prompt_ranking_margin', 0.1),
+            getattr(self.args, 'gate_temperature', 0.1),
+            getattr(self.args, 'gate_threshold', 0.0),
         )
         self.neg_prompt_embed = None
+        self.hard_negative_candidates = {}
+
+    @staticmethod
+    def normalize_prompt(prompt):
+        return " ".join(prompt.strip().lower().split())
+
+    def on_train_start(self):
+        """Build a small semantic hard-negative candidate bank once per run."""
+        if not getattr(self.args, 'use_prompt_ranking', True) or not self.all_classes:
+            return
+        classes = sorted(set(self.all_classes))
+        class_prompts = [f"a photo of {class_name}" for class_name in classes]
+        class_tokens = clip_count.clip.tokenize(class_prompts).to(self.device)
+        with torch.no_grad(), torch.amp.autocast("cuda"):
+            # Use frozen, original CLIP semantics for candidate mining.  The
+            # trainable CoOp encoder is still used below when computing loss.
+            embeddings = self.model.clip.encode_text(class_tokens)
+        embeddings = F.normalize(embeddings.float(), dim=-1)
+        similarities = embeddings @ embeddings.transpose(0, 1)
+        top_k = max(1, min(getattr(self.args, 'hard_negative_k', 4), len(classes) - 1))
+        max_similarity = getattr(
+            self.args, 'hard_negative_max_similarity', 0.9
+        )
+
+        self.hard_negative_candidates = {}
+        for index, class_name in enumerate(classes):
+            valid = torch.ones(len(classes), device=self.device, dtype=torch.bool)
+            valid[index] = False
+            valid &= similarities[index] <= max_similarity
+            if not valid.any():
+                valid = torch.ones_like(valid)
+                valid[index] = False
+            scores = similarities[index].masked_fill(~valid, float('-inf'))
+            candidate_indices = torch.topk(scores, k=min(top_k, int(valid.sum()))).indices
+            self.hard_negative_candidates[self.normalize_prompt(class_name)] = [
+                classes[candidate_index] for candidate_index in candidate_indices.tolist()
+            ]
+        preview = list(self.hard_negative_candidates.items())[:5]
+        print(f"Built hard-negative bank for {len(classes)} classes. Examples: {preview}")
+
+    def select_semantic_hard_negative_prompts(self, prompts):
+        negative_prompts = []
+        valid_negative = []
+        all_classes = sorted(set(self.all_classes or []))
+        for prompt in prompts:
+            candidates = self.hard_negative_candidates.get(
+                self.normalize_prompt(prompt), []
+            )
+            if candidates:
+                negative_prompts.append(random.choice(candidates))
+                valid_negative.append(True)
+                continue
+            fallback = [
+                name for name in all_classes
+                if self.normalize_prompt(name) != self.normalize_prompt(prompt)
+            ]
+            if fallback:
+                negative_prompts.append(random.choice(fallback))
+                valid_negative.append(True)
+            else:
+                negative_prompts.append(prompt)
+                valid_negative.append(False)
+        return negative_prompts, torch.tensor(
+            valid_negative, device=self.device, dtype=torch.bool
+        )
 
     @staticmethod
     def select_in_batch_negative_text(text_embedding, prompts):
-        """Select the least-similar differently named prompt in each batch row."""
+        """Fallback: select the most-similar differently named in-batch prompt."""
         batch_size = text_embedding.shape[0]
         normalized_text = F.normalize(text_embedding.detach().squeeze(1), dim=-1)
         text_similarity = normalized_text @ normalized_text.transpose(0, 1)
@@ -184,8 +265,8 @@ class Model(LightningModule):
             dtype=torch.bool,
         )
         valid_negative = valid.any(dim=1)
-        candidate_similarity = text_similarity.masked_fill(~valid, float('inf'))
-        negative_indices = candidate_similarity.argmin(dim=1)
+        candidate_similarity = text_similarity.masked_fill(~valid, float('-inf'))
+        negative_indices = candidate_similarity.argmax(dim=1)
         # Rows without a valid negative are ignored by PromptRankingLoss.  Use
         # their own embedding here only to keep indexing well-defined.
         fallback = torch.arange(batch_size, device=text_embedding.device)
@@ -226,13 +307,24 @@ class Model(LightningModule):
             self.log('train_loss_contrast', contrast_loss)
 
         if getattr(self.args, 'use_prompt_ranking', True):
-            negative_text_embedding, valid_negative = (
-                self.select_in_batch_negative_text(text_embedding, prompt_gt)
-            )
+            if self.hard_negative_candidates:
+                negative_prompts, valid_negative = (
+                    self.select_semantic_hard_negative_prompts(prompt_gt)
+                )
+                negative_text_embedding = self.model.encode_text(
+                    negative_prompts, self.device, require_grad=True
+                )
+            else:
+                negative_text_embedding, valid_negative = (
+                    self.select_in_batch_negative_text(text_embedding, prompt_gt)
+                )
             (
                 prompt_ranking_loss,
+                gate_calibration_loss,
                 positive_target_similarity,
                 negative_target_similarity,
+                positive_target_gate,
+                negative_target_gate,
             ) = self.prompt_ranking_loss(
                 patch_embedding_contrast,
                 text_embedding,
@@ -241,7 +333,9 @@ class Model(LightningModule):
                 valid_negative,
             )
             loss = loss + getattr(self.args, 'w_prompt_ranking', 0.1) * prompt_ranking_loss
+            loss = loss + getattr(self.args, 'w_gate_calibration', 0.05) * gate_calibration_loss
             self.log('train_loss_prompt_ranking', prompt_ranking_loss)
+            self.log('train_loss_gate_calibration', gate_calibration_loss)
             self.log('train_prompt_ranking_valid_ratio', valid_negative.float().mean())
             self.log('train_target_similarity_positive', positive_target_similarity)
             self.log('train_target_similarity_negative', negative_target_similarity)
@@ -249,6 +343,16 @@ class Model(LightningModule):
                 'train_target_similarity_margin',
                 positive_target_similarity - negative_target_similarity,
             )
+            self.log('train_target_gate_positive', positive_target_gate)
+            self.log('train_target_gate_negative', negative_target_gate)
+
+        raw_density = extra_out['raw_density']
+        raw_count = raw_density.sum(dim=(1, 2)) / SCALE_FACTOR
+        final_count = output.sum(dim=(1, 2)) / SCALE_FACTOR
+        suppression_ratio = 1.0 - final_count / raw_count.clamp_min(1e-6)
+        self.log('train_raw_count_mean', raw_count.mean())
+        self.log('train_gated_count_mean', final_count.mean())
+        self.log('train_gate_suppression_ratio', suppression_ratio.mean())
 
 
         self.log('train_loss', loss)
@@ -600,8 +704,7 @@ if __name__ == '__main__':
         )
         if args.ckpt is None:
             raise ValueError("Please specify a checkpoint to test")
-        model = Model.load_from_checkpoint(args.ckpt,strict=False)
-        model.overwrite_args(args)
+        model = Model.load_from_checkpoint(args.ckpt, args=args, strict=False)
         model.eval()
         if args.dataset_type == "FSC" or args.dataset_type == "COCO": #CARPK and ShanghaiTech do not have val set
             print("====Metric on val set====")
@@ -614,7 +717,7 @@ if __name__ == '__main__':
     elif args.mode == "app":
         if args.ckpt is None:
             raise ValueError("Please specify a checkpoint to test")
-        model = Model.load_from_checkpoint(args.ckpt,strict=False)
+        model = Model.load_from_checkpoint(args.ckpt, args=args, strict=False)
         model.eval()
         def infer(img, prompt):
             model.eval()

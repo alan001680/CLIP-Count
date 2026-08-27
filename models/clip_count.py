@@ -28,6 +28,7 @@ class CLIPCount(nn.Module):
                  use_mixed_fim:bool=False, 
                  unfreeze_vit:bool=False,
                  use_similarity_gate:bool=False,
+                 gate_position:str=None,
                  gate_temperature:float=0.1,
                  gate_threshold:float=0.0,
                  gate_residual:float=0.2):
@@ -47,6 +48,7 @@ class CLIPCount(nn.Module):
             use_mixed_fim: whether to use a hierarchical transformer for patch-text interaction
             unfreeze_vit: whether to fintune all clip vit parameters.
             use_similarity_gate: whether patch-text similarity controls the decoder features.
+            gate_position: where to apply the gate: none, feature, density, or both.
             gate_temperature: sigmoid temperature for the similarity gate.
             gate_threshold: cosine-similarity value at the sigmoid midpoint.
             gate_residual: minimum fraction of decoder features retained by the gate.
@@ -57,7 +59,15 @@ class CLIPCount(nn.Module):
             raise ValueError("gate_temperature must be greater than zero")
         if not 0.0 <= gate_residual <= 1.0:
             raise ValueError("gate_residual must be between 0 and 1")
-        self.use_similarity_gate = use_similarity_gate
+        if gate_position is None:
+            gate_position = "feature" if use_similarity_gate else "none"
+        if gate_position not in {"none", "feature", "density", "both"}:
+            raise ValueError(
+                "gate_position must be one of: none, feature, density, both"
+            )
+        self.gate_position = gate_position
+        # Kept for compatibility with older callers and diagnostic scripts.
+        self.use_similarity_gate = gate_position != "none"
         self.gate_temperature = gate_temperature
         self.gate_threshold = gate_threshold
         self.gate_residual = gate_residual
@@ -192,13 +202,14 @@ class CLIPCount(nn.Module):
         # Original prediction path (available with use_similarity_gate=False):
         # x = patch_embedding
         x = patch_embedding
-        if self.use_similarity_gate:
+        use_feature_gate = self.gate_position in {"feature", "both"}
+        if use_feature_gate:
             residual_gate = self.gate_residual + (
                 1.0 - self.gate_residual
             ) * patch_text_gate
             x = x * residual_gate.to(dtype=x.dtype).unsqueeze(-1)
-        extra_out['decoder_gate_scale'] = (
-            residual_gate if self.use_similarity_gate
+        extra_out['feature_gate_scale'] = (
+            residual_gate if use_feature_gate
             else torch.ones_like(patch_text_gate)
         )
         x = x + self.patch_emb_pos_embed # [B, 196, 512]
@@ -223,21 +234,42 @@ class CLIPCount(nn.Module):
         x = self.seq_2_2d(x)
         extra_out['pixel_text_matching_map'] = x
         if self.use_mixed_fim:
-            pred_density = self.density_decoder.forward_hierarchical(xs)
+            raw_density = self.density_decoder.forward_hierarchical(xs)
         else:
-            pred_density = self.density_decoder(x)
+            raw_density = self.density_decoder(x)
+
+        extra_out['raw_density'] = raw_density
+        use_density_gate = self.gate_position in {"density", "both"}
+        if use_density_gate:
+            grid_size = int(math.sqrt(patch_text_gate.shape[1]))
+            if grid_size * grid_size != patch_text_gate.shape[1]:
+                raise ValueError(
+                    f"Patch count is not a square grid: {patch_text_gate.shape[1]}"
+                )
+            density_gate = F.interpolate(
+                patch_text_gate.reshape(-1, 1, grid_size, grid_size),
+                size=raw_density.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(1)
+            density_gate_scale = self.gate_residual + (
+                1.0 - self.gate_residual
+            ) * density_gate
+            pred_density = raw_density * density_gate_scale.to(raw_density.dtype)
+        else:
+            density_gate = torch.ones_like(raw_density)
+            density_gate_scale = density_gate
+            pred_density = raw_density
+        extra_out['density_gate'] = density_gate
+        extra_out['density_gate_scale'] = density_gate_scale
+        extra_out['gated_density'] = pred_density
 
         return pred_density, extra_out
 
     def forward(self, imgs, text, return_extra:bool = False, coop_require_grad:bool = False):
-
-        text_token = clip.tokenize(text).to(imgs.device)
-
-        if coop_require_grad:
-            text_embedding = self.text_encoder(text_token).float()
-        else:
-            with torch.no_grad():
-                text_embedding = self.text_encoder(text_token).float()
+        text_embedding = self.encode_text(
+            text, imgs.device, require_grad=coop_require_grad
+        )
 
         cls_token, img_feat_patches = self.forward_visual_encoder(imgs, text_embedding)
         pred_density, extra_out = self.forward_decoder(img_feat_patches, text_embedding, cls_token)  # [N, 384, 384]
@@ -245,6 +277,13 @@ class CLIPCount(nn.Module):
         if return_extra:
             return pred_density, extra_out
         return pred_density
+
+    def encode_text(self, text, device, require_grad=False):
+        text_token = clip.tokenize(text).to(device)
+        if require_grad:
+            return self.text_encoder(text_token).float()
+        with torch.no_grad():
+            return self.text_encoder(text_token).float()
     
     def seq_2_2d(self,x):
         n, hw, c = x.shape

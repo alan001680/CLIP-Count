@@ -60,9 +60,11 @@ class PromptRankingLoss(nn.Module):
     class, where the correct class name is known.
     """
 
-    def __init__(self, margin=0.1):
+    def __init__(self, margin=0.1, gate_temperature=0.1, gate_threshold=0.0):
         super().__init__()
         self.margin = margin
+        self.gate_temperature = gate_temperature
+        self.gate_threshold = gate_threshold
 
     def forward(
         self,
@@ -100,9 +102,32 @@ class PromptRankingLoss(nn.Module):
             # Preserve a differentiable zero when no valid in-batch negative
             # or annotated target patch is available.
             zero = ranking.sum() * 0.0
-            return zero, zero.detach(), zero.detach()
+            return (
+                zero,
+                zero,
+                zero.detach(),
+                zero.detach(),
+                zero.detach(),
+                zero.detach(),
+            )
+
+        positive_target_similarity = positive_similarity[target_mask]
+        negative_target_similarity = negative_similarity[target_mask]
+        positive_gate_logits = (
+            positive_target_similarity - self.gate_threshold
+        ) / self.gate_temperature
+        negative_gate_logits = (
+            negative_target_similarity - self.gate_threshold
+        ) / self.gate_temperature
+        gate_calibration_loss = (
+            F.softplus(-positive_gate_logits).mean()
+            + F.softplus(negative_gate_logits).mean()
+        )
         return (
             ranking[target_mask].mean(),
-            positive_similarity[target_mask].mean(),
-            negative_similarity[target_mask].mean(),
+            gate_calibration_loss,
+            positive_target_similarity.mean(),
+            negative_target_similarity.mean(),
+            torch.sigmoid(positive_gate_logits).mean(),
+            torch.sigmoid(negative_gate_logits).mean(),
         )
