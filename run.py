@@ -39,13 +39,13 @@ os.environ["CUDA_LAUNCH_BLOCKING"] = '1'
 
 def get_args_parser():
     parser = argparse.ArgumentParser('CLIP-Count', add_help=False)
-    parser.add_argument("--mode",type = str, default = "train", choices = ["train", "test", "app"], help = "train or test or an interactive application")
+    parser.add_argument("--mode",type = str, default = "app", choices = ["train", "test", "app"], help = "train or test or an interactive application")
 
-    parser.add_argument("--exp_name",type = str, default = "hard-negative-density-gate", help = "experiment name")
+    parser.add_argument("--exp_name",type = str, default = "conservative-density-gate", help = "experiment name")
 
     parser.add_argument('--batch_size', default=32, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
-    parser.add_argument('--epochs', default=20, type=int)
+    parser.add_argument('--epochs', default=5, type=int)
     parser.add_argument('--accum_iter', default=1, type=int,
                         help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
     
@@ -68,7 +68,7 @@ def get_args_parser():
                         help='sigmoid temperature of the patch-text similarity gate')
     parser.add_argument('--gate_threshold', default=0.0, type=float,
                         help='cosine-similarity threshold at the gate midpoint')
-    parser.add_argument('--gate_residual', default=0.2, type=float,
+    parser.add_argument('--gate_residual', default=0.8, type=float,
                         help='minimum feature or density fraction retained by the gate')
     
     #contrastive loss related
@@ -89,7 +89,7 @@ def get_args_parser():
     parser.add_argument('--contrast_pre_epoch', default = 0, type = int, help = "how many epoch to use contrastive pretraining")
     parser.add_argument('--use_prompt_ranking', default=True, type=misc.str2bool,
                         help='rank the correct class above an in-batch wrong class at annotated target patches')
-    parser.add_argument('--w_prompt_ranking', default=0.1, type=float,
+    parser.add_argument('--w_prompt_ranking', default=0.01, type=float,
                         help='weight of the target-patch prompt ranking loss')
     parser.add_argument('--prompt_ranking_margin', default=0.1, type=float,
                         help='required cosine-similarity margin between correct and wrong prompts')
@@ -97,13 +97,13 @@ def get_args_parser():
                         help='number of semantically similar class candidates per target class')
     parser.add_argument('--hard_negative_max_similarity', default=0.9, type=float,
                         help='exclude likely synonyms above this text cosine similarity')
-    parser.add_argument('--w_gate_calibration', default=0.05, type=float,
+    parser.add_argument('--w_gate_calibration', default=0.005, type=float,
                         help='weight of target-patch positive/negative gate calibration')
     
     # Optimizer parameters
     parser.add_argument('--weight_decay', type=float, default=0.05,
                         help='weight decay (default: 0.05)')
-    parser.add_argument('--lr', type=float, default=1e-5, metavar='LR',
+    parser.add_argument('--lr', type=float, default=1e-6, metavar='LR',
                         help='learning rate (absolute lr)')
     parser.add_argument('--min_lr', type=float, default=0., metavar='LR',
                         help='lower lr bound for cyclic schedulers that hit 0')
@@ -173,7 +173,7 @@ class Model(LightningModule):
                         ),
                         gate_temperature=getattr(self.args, 'gate_temperature', 0.1),
                         gate_threshold=getattr(self.args, 'gate_threshold', 0.0),
-                        gate_residual=getattr(self.args, 'gate_residual', 0.2),
+                        gate_residual=getattr(self.args, 'gate_residual', 0.8),
                         )
         self.loss = F.mse_loss
         self.contrastive_loss = ContrastiveLoss(0.07,self.args.noise_text_ratio, self.args.normalize_contrast)
@@ -332,8 +332,8 @@ class Model(LightningModule):
                 gt_density,
                 valid_negative,
             )
-            loss = loss + getattr(self.args, 'w_prompt_ranking', 0.1) * prompt_ranking_loss
-            loss = loss + getattr(self.args, 'w_gate_calibration', 0.05) * gate_calibration_loss
+            loss = loss + getattr(self.args, 'w_prompt_ranking', 0.01) * prompt_ranking_loss
+            loss = loss + getattr(self.args, 'w_gate_calibration', 0.005) * gate_calibration_loss
             self.log('train_loss_prompt_ranking', prompt_ranking_loss)
             self.log('train_loss_gate_calibration', gate_calibration_loss)
             self.log('train_prompt_ranking_valid_ratio', valid_negative.float().mean())

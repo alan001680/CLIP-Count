@@ -31,7 +31,7 @@ class CLIPCount(nn.Module):
                  gate_position:str=None,
                  gate_temperature:float=0.1,
                  gate_threshold:float=0.0,
-                 gate_residual:float=0.2):
+                 gate_residual:float=0.8):
         """
         The CLIP-Count model   
         Param:

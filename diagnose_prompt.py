@@ -26,7 +26,7 @@ def get_args_parser():
     parser = argparse.ArgumentParser(
         description="Compare CLIP-Count outputs for multiple prompts on one image."
     )
-    parser.add_argument("--ckpt", type=Path, default="lightning_logs/exp0825/version_0/checkpoints/epoch=193-val_mae=13.63.ckpt", help="Lightning .ckpt file")
+    parser.add_argument("--ckpt", type=Path, default="lightning_logs/hard-negative-density-gate/version_1/checkpoints/epoch=1-val_mae=24.53.ckpt", help="Lightning .ckpt file")
     parser.add_argument("--image", type=Path, default="data/FSC/images_384_VarV2/3.jpg", help="Input image")
     parser.add_argument(
         "--prompts",
@@ -49,7 +49,7 @@ def get_args_parser():
     )
     parser.add_argument(
         "--gate-residual",
-        default=0.2,
+        default=0.8,
         type=float,
         help="Minimum decoder-feature scale when the model gate is enabled",
     )
