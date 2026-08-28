@@ -50,7 +50,8 @@ class FSC147(Dataset):
         self.gt_dir = os.path.join(self.data_dir, 'gt_density_map_adaptive_384_VarV2')
         self.anno_file = os.path.join(self.data_dir,self.dataset_type , f'annotation_{self.dataset_type}_384.json')
         self.data_split_file = os.path.join(self.data_dir,self.dataset_type ,f'Train_Test_Val_{self.dataset_type}.json')
-        self.class_file = os.path.join(self.data_dir, self.dataset_type ,f'ImageClasses_{self.dataset_type}.txt')
+        # self.class_file = os.path.join(self.data_dir, self.dataset_type ,f'ImageClasses_{self.dataset_type}.txt')
+        self.class_file = os.path.join(self.data_dir, self.dataset_type ,f'ImageClasses_{self.dataset_type}_object.txt') # 2026/08/28 新增-測試文字是否有幫助 
         self.split = split
         with open(self.data_split_file) as f:
             data_split = json.load(f)

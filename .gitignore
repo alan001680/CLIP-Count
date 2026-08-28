@@ -4,7 +4,7 @@ out/
 __pycache__/
 lightning_logs/
 lightning_logs_prev/
-
+diagnose_prompt_output/
 debug/
 
 .Ds_Store

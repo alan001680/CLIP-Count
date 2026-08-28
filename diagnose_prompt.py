@@ -25,7 +25,7 @@ def get_args_parser():
     parser = argparse.ArgumentParser(
         description="Compare CLIP-Count outputs for multiple prompts on one image."
     )
-    parser.add_argument("--ckpt", type=Path, default="lightning_logs/exp0821/version_0/checkpoints/epoch=194-val_mae=15.94.ckpt", help="Lightning .ckpt file")
+    parser.add_argument("--ckpt", type=Path, default="lightning_logs/exp0828/version_1/checkpoints/epoch=179-val_mae=15.21.ckpt", help="Lightning .ckpt file")
     parser.add_argument("--image", type=Path, default="data/FSC/images_384_VarV2/41.jpg", help="Input image")
     parser.add_argument(
         "--prompts",

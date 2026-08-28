@@ -37,11 +37,22 @@ from util.constant import SCALE_FACTOR
 
 os.environ["CUDA_LAUNCH_BLOCKING"] = '1'
 
+
+def optional_string(value):
+    """Convert empty/None-like command-line values to Python None."""
+    if value is None:
+        return None
+    value = value.strip()
+    if value.lower() in {"", "none", "null"}:
+        return None
+    return value
+
+
 def get_args_parser():
     parser = argparse.ArgumentParser('CLIP-Count', add_help=False)
-    parser.add_argument("--mode",type = str, default = "app", choices = ["train", "test", "app"], help = "train or test or an interactive application")
+    parser.add_argument("--mode",type = str, default = "test", choices = ["train", "test", "app"], help = "train or test or an interactive application")
 
-    parser.add_argument("--exp_name",type = str, default = "exp0825", help = "experiment name")
+    parser.add_argument("--exp_name",type = str, default = "exp0828", help = "experiment name")
 
     parser.add_argument('--batch_size', default=32, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
@@ -95,7 +106,14 @@ def get_args_parser():
                         help='path where to save, empty for no saving')
     parser.add_argument('--seed', default=1, type=int)
 
-    parser.add_argument('--ckpt', default= 'lightning_logs/exp0824/version_2/checkpoints/epoch=94-val_mae=14.38.ckpt', type = str,  help='path of resume from checkpoint')
+    parser.add_argument(
+        '--ckpt',
+        default='lightning_logs/exp0828/version_0/checkpoints/epoch=198-val_mae=14.61.ckpt',
+        nargs='?',
+        const=None,
+        type=optional_string,
+        help='checkpoint path; empty string, None, or null means no checkpoint',
+    )
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')
     parser.add_argument('--num_workers', default=12, type=int)
